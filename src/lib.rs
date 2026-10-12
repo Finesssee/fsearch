@@ -5,12 +5,17 @@
 
 pub mod content;
 mod engine;
+#[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(windows)]
+#[path = "fsevents_win.rs"]
+mod fsevents;
+pub mod os;
 pub mod index;
 pub mod live;
 pub mod query;
 pub mod walk;
 
 pub use content::{FileMatches, Grep, GrepResult};
-pub use engine::{Engine, Found, Options, Status, default_dir, gated, has_full_disk_access, no_materialize};
+pub use engine::{CONTENT_SYNCED, Engine, Found, Options, Status, default_dir, gated, has_full_disk_access, no_materialize};
 pub use query::{GrepMode, Query};

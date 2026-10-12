@@ -71,9 +71,25 @@ struct Ctx {
     out: Vec<Mutex<Vec<Listing>>>,
 }
 
+#[cfg(target_os = "macos")]
 thread_local! {
     static BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 256 * 1024]);
 }
+
+fn push(l: Listing, ctx: &Ctx) {
+    LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
+    let slot = rayon::current_thread_index().unwrap_or(ctx.out.len() - 1);
+    ctx.out[slot].lock().unwrap().push(l);
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::{list_one, scan};
+#[cfg(windows)]
+pub use win::{list_one, roots, scan};
+
+#[cfg(target_os = "macos")]
+mod mac {
+use super::*;
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
@@ -188,12 +204,6 @@ fn entry_count(dir: i32, name: &CString) -> Option<u32> {
     let mut b = [0u32; 2];
     let r = unsafe { libc::getattrlistat(dir, name.as_ptr(), (&raw mut al).cast(), b.as_mut_ptr().cast(), 8, libc::FSOPT_NOFOLLOW as _) };
     (r == 0).then_some(b[1])
-}
-
-fn push(l: Listing, ctx: &Ctx) {
-    LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
-    let slot = rayon::current_thread_index().unwrap_or(ctx.out.len() - 1);
-    ctx.out[slot].lock().unwrap().push(l);
 }
 
 fn rd32(b: &[u8], at: usize) -> u32 {
@@ -312,4 +322,120 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
     }
     l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
     l.names.extend_from_slice(name);
+}
+}
+
+/// Windows: `/` is virtual and holds the drives in FSEARCH_ROOTS
+/// (`;`-separated, default `C:`), then each folder is listed with
+/// FindFirstFile/FindNextFile via std::fs::read_dir, which carries size,
+/// mtime and attributes with each entry (no per-file stat). Reparse points
+/// (symlinks, junctions) are not followed.
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+    /// `FSEARCH_ROOTS` (`C:;D:`), or every fixed drive.
+    pub fn roots() -> Vec<Vec<u8>> {
+        let v = std::env::var("FSEARCH_ROOTS").unwrap_or_else(|_| fixed_drives());
+        v.split(';').map(|r| r.trim().trim_end_matches(['/', '\\']).as_bytes().to_vec()).filter(|r| !r.is_empty()).collect()
+    }
+
+    fn fixed_drives() -> String {
+        unsafe extern "system" {
+            fn GetLogicalDrives() -> u32;
+            fn GetDriveTypeW(root: *const u16) -> u32;
+        }
+        const DRIVE_FIXED: u32 = 3;
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| format!("{}:", (b'A' + i) as char))
+            .filter(|d| {
+                let w: Vec<u16> = format!("{d}\\").encode_utf16().chain([0]).collect();
+                unsafe { GetDriveTypeW(w.as_ptr()) == DRIVE_FIXED }
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
+        pool.scope(|s| finish_dir(s, root.to_vec(), 0, &ctx));
+        let mut out = Vec::new();
+        for p in ctx.out {
+            out.extend(p.into_inner().unwrap());
+        }
+        out
+    }
+
+    pub fn list_one(path: &[u8]) -> Option<Listing> {
+        if blocked(path) {
+            return None;
+        }
+        let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+        list_into(path, &mut l).then_some(l)
+    }
+
+    fn list_into(path: &[u8], l: &mut Listing) -> bool {
+        if path == b"/" {
+            for r in roots() {
+                l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: r.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: NONE });
+                l.names.extend_from_slice(&r);
+            }
+            return true;
+        }
+        let Ok(rd) = std::fs::read_dir(crate::os::os_path(path)) else { return false };
+        for e in rd.flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            let name = e.file_name();
+            let name = name.as_encoded_bytes();
+            if name.is_empty() || name.len() > u16::MAX as usize {
+                continue;
+            }
+            let ft = m.file_type();
+            let mut kind = if ft.is_symlink() {
+                KIND_LINK
+            } else if ft.is_dir() {
+                KIND_DIR
+            } else if ft.is_file() {
+                KIND_FILE
+            } else {
+                KIND_OTHER
+            };
+            if m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+                kind |= FLAG_HIDDEN;
+            }
+            let size = if kind & 3 == KIND_FILE { m.len() } else { 0 };
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime: crate::os::mtime_secs(&m), child: NONE });
+            l.names.extend_from_slice(name);
+        }
+        true
+    }
+
+    fn finish_dir<'s>(s: &Scope<'s>, path: Vec<u8>, id: u32, ctx: &'s Ctx) {
+        let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+        if !blocked(&path) && !list_into(&path, &mut l) && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied {
+            DENIED.lock().unwrap().push(path.clone());
+        }
+        let mut kids = Vec::new();
+        for e in l.ents.iter_mut() {
+            if e.kind & 3 == KIND_DIR {
+                let name = &l.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+                let child = crate::live::join(&path, name);
+                if blocked(&child) {
+                    continue;
+                }
+                e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
+                kids.push((child, e.child));
+            }
+        }
+        push(l, ctx);
+        for (child, cid) in kids {
+            s.spawn(move |s| finish_dir(s, child, cid, ctx));
+        }
+    }
 }

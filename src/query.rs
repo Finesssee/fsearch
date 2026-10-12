@@ -353,7 +353,20 @@ impl Query {
             }
             "in" => {
                 let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
-                self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
+                #[cfg(windows)]
+                {
+                    // Index paths are `/D:/a/b`; accept `D:\a\b`, `D:/a/b` and `/D:/a/b`.
+                    let mut p = p.strip_prefix('/').unwrap_or(&p).to_string();
+                    // `D:` alone is the drive's current directory, not its root.
+                    if p.len() == 2 && p.ends_with(':') {
+                        p.push('/');
+                    }
+                    self.scope = Some(crate::os::index_path(std::path::Path::new(&real_path(p))));
+                }
+                #[cfg(not(windows))]
+                {
+                    self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
+                }
             }
             "size" => self.size = range(v, parse_size)?,
             "mtime" | "modified" => {

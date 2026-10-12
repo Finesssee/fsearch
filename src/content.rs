@@ -82,6 +82,11 @@ const TEXT_EXTS: &[&[u8]] = &[
     b"gradle", b"cmake", b"mk", b"make", b"dockerfile", b"log", b"jsonl", b"ndjson", b"diff", b"patch", b"srt", b"vtt", b"rtf",
     b"svg", b"pl", b"pm", b"ps1", b"bat", b"vim", b"el", b"lisp", b"scm", b"rkt", b"elm", b"purs", b"sol", b"v", b"sv", b"vhd",
     b"asm", b"s", b"d", b"cr", b"pas", b"f90", b"cmd", b"service", b"desktop", b"gitignore", b"editorconfig", b"lock", b"sum",
+    b"cu", b"cuh", b"hxx", b"inl", b"ipp", b"tcc", b"cl", b"comp", b"vert", b"frag", b"geom", b"tesc", b"tese", b"hlsli",
+    b"in", b"am", b"ac", b"bzl", b"bazel", b"gn", b"gni", b"ninja", b"meson", b"pbxproj", b"xcconfig", b"entitlements",
+    b"sln", b"csproj", b"vcxproj", b"fsproj", b"vbproj", b"props", b"targets", b"xaml", b"razor", b"cshtml", b"resx",
+    b"vb", b"fsi", b"fsx", b"psm1", b"psd1", b"gd", b"gdshader", b"odin", b"mojo", b"mdc",
+    b"jinja", b"j2", b"idl", b"tmpl", b"hbs", b"ejs", b"mustache", b"liquid", b"twig",
 ];
 
 pub struct Segment {
@@ -2132,7 +2137,7 @@ fn helpers() -> &'static Helpers {
             let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
                 // Someone is waiting: keep off the slow cores and out of the
                 // throttled IO tiers, and never download iCloud placeholders.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                unsafe { crate::os::set_qos(crate::os::Qos::Initiated) };
                 crate::no_materialize();
                 let mut seen = 0;
                 loop {
@@ -2373,6 +2378,12 @@ const SCAN_READERS: usize = 8;
 
 /// Run `f` with this thread never downloading iCloud placeholders (as the
 /// helper threads), then restore its policy.
+#[cfg(not(target_os = "macos"))]
+fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[cfg(target_os = "macos")]
 fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
     unsafe extern "C" {
         fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
@@ -3144,9 +3155,18 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
 
 /// `open_regular`, and the file's size.
 fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(crate::os::os_path(path)).ok()?
+    };
+    // FILE_FLAG_OPEN_REPARSE_POINT: a symlink opens as itself (not a file),
+    // like O_NOFOLLOW.
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(0x0020_0000).open(crate::os::os_path(path)).ok()?
+    };
     let m = f.metadata().ok()?;
     m.is_file().then_some((f, m.len()))
 }
@@ -3154,9 +3174,16 @@ fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
 /// `open_regular` for a file about to be indexed, telling the kernel to
 /// start reading it now (as much as indexing reads).
 fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
     let (f, len) = open_sized(path)?;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "macos")]
     let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
-    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = len;
     Some(f)
 }

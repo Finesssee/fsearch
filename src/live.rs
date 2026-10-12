@@ -495,6 +495,23 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (lo, hi)
 }
 
+#[cfg(windows)]
+pub fn lstat(path: &[u8]) -> Option<OEnt> {
+    let m = std::fs::symlink_metadata(crate::os::os_path(path)).ok()?;
+    let ft = m.file_type();
+    let kind = if ft.is_symlink() {
+        walk::KIND_LINK
+    } else if ft.is_dir() {
+        KIND_DIR
+    } else if ft.is_file() {
+        walk::KIND_FILE
+    } else {
+        walk::KIND_OTHER
+    };
+    Some(OEnt::new(path, kind, if ft.is_file() { m.len() } else { 0 }, crate::os::mtime_secs(&m)))
+}
+
+#[cfg(unix)]
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };

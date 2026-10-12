@@ -1,4 +1,6 @@
 mod server;
+#[cfg(windows)]
+mod pipe;
 
 use fsearch::{index, live, query};
 
@@ -11,9 +13,12 @@ use std::time::Instant;
 /// go straight back with munmap. macOS's malloc keeps freed large blocks
 /// mapped and dirty, which left the daemon at ~1 GB footprint after a build
 /// while only ~2 MB was live.
+#[cfg(target_os = "macos")]
 struct Alloc;
+#[cfg(target_os = "macos")]
 const BIG: usize = 1 << 20;
 
+#[cfg(target_os = "macos")]
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if l.size() < BIG || l.align() > 16384 {
@@ -48,9 +53,11 @@ unsafe impl GlobalAlloc for Alloc {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
+#[cfg(target_os = "macos")]
 const USAGE: &str = "usage:
   fsearch <query...> [--json]   search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
@@ -61,22 +68,136 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "mt.nd.fsearch";
 
+#[cfg(target_os = "macos")]
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
 }
 
+/// The content-indexed folder, as an index path (`/D:/code`). `/` means
+/// every indexed drive: the empty prefix, which every path starts with.
+#[cfg(windows)]
+fn home() -> String {
+    let h = std::env::var_os("FSEARCH_HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_default();
+    if h == "/" {
+        return String::new();
+    }
+    String::from_utf8_lossy(&fsearch::os::index_path(std::path::Path::new(&h))).into_owned()
+}
+
+#[cfg(windows)]
+fn data_dir() -> PathBuf {
+    let d = fsearch::default_dir(&home());
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+#[cfg(windows)]
+const USAGE: &str = "usage:
+  fsearch <query...> [--json] [--all]
+                                search (starts the daemon if needed); --all lists every
+                                match instead of what 250 ms finds
+  fsearch stdio                 JSON lines on stdin/stdout
+  fsearch serve                 run the daemon in the foreground
+  fsearch status
+  fsearch stop                  stop the daemon (keeps the index)
+  fsearch install [--login]     copy to ~/.local/bin; --login also starts the daemon at login
+                                and saves FSEARCH_ROOTS/FSEARCH_HOME as user variables
+  fsearch uninstall             remove the login entry (keeps the binary and the index)
+  fsearch index                 build the name and content index in-process, then exit
+  fsearch bench <query...>      time a query in-process against the saved index
+env: FSEARCH_ROOTS=C:;D: drives for the name index (default: every fixed drive),
+     FSEARCH_HOME=D:/code folder for content (/ for every drive; default: the user profile),
+     FSEARCH_RUNS=20 bench repetitions";
+
+#[cfg(windows)]
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("-h" | "--help") => eprintln!("{USAGE}"),
+        Some("serve") => {
+            if args.iter().any(|a| a == "--log") {
+                server::log_to(&data_dir());
+            }
+            server::serve(data_dir(), home())
+        }
+        Some("stdio") => stdio(),
+        Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
+        Some("stop") => server::stop(&data_dir()).unwrap_or_else(|e| die(&e)),
+        Some("index") => build_index(),
+        Some("bench") => bench(&args[1..].join(" ")),
+        Some("install") => install(args.iter().any(|a| a == "--login")),
+        Some("uninstall") => uninstall(),
+        Some(_) => {
+            let json = args.iter().any(|a| a == "--json");
+            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| !matches!(*a, "--json" | "--all")).collect();
+            let mut req = serde_json::json!({"q": q.join(" ")});
+            if args.iter().any(|a| a == "--all") {
+                req["budget_ms"] = 0.into();
+                req["limit"] = u32::MAX.into();
+            }
+            print_one(&req, json);
+        }
+    }
+}
+
+/// A pipe can't be half-closed, and a synchronous read would block a write
+/// on the same handle, so requests go one at a time: each gets one line back.
+#[cfg(windows)]
+fn stdio() {
+    let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
+    let mut up = s.try_clone().unwrap();
+    let mut down = BufReader::new(s);
+    let mut out = std::io::stdout().lock();
+    let mut reply = String::new();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        reply.clear();
+        if writeln!(up, "{line}").is_err() || down.read_line(&mut reply).unwrap_or(0) == 0 {
+            break;
+        }
+        if out.write_all(reply.as_bytes()).and_then(|_| out.flush()).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn build_index() {
+    let t = Instant::now();
+    let e = fsearch::Engine::start(fsearch::Options { dir: data_dir(), home: home(), skip: Some(Vec::new()) }).unwrap_or_else(|e| die(&e));
+    while !fsearch::CONTENT_SYNCED.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let s = e.status();
+    eprintln!(
+        "indexed {} entries, {} content docs ({:.0} MB content, {:.0} MB names) in {:.2?}",
+        s.entries,
+        s.content_docs,
+        s.content_bytes as f64 / 1e6,
+        s.index_bytes as f64 / 1e6,
+        t.elapsed()
+    );
+}
+
+#[cfg(target_os = "macos")]
 fn data_dir() -> PathBuf {
     let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
     std::fs::create_dir_all(&d).ok();
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
@@ -103,6 +224,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     s.write_all(format!("{req}\n").as_bytes()).unwrap();
     // One request only: the daemon needn't keep the cores warm for a next one.
+    #[cfg(unix)]
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).unwrap();
@@ -126,6 +248,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     let _ = out.flush();
 }
 
+#[cfg(target_os = "macos")]
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     let mut up = s.try_clone().unwrap();
@@ -155,12 +278,16 @@ fn bench(qs: &str) {
     let mut q = query::Query::parse(qs, &home).unwrap_or_else(|e| die(&e));
     // Like the daemon: a content search when the query has a pattern, on
     // user-interactive threads, paths included.
-    let grep = q.grep.take().map(|p| fsearch::Grep::new(&p, q.grep_mode).unwrap_or_else(|e| die(&e)));
+    // The daemon's 250 ms budget returns partial results; a benchmark wants all of them.
+    let grep = q.grep.take().map(|p| {
+        let mut g = fsearch::Grep::new(&p, q.grep_mode).unwrap_or_else(|e| die(&e));
+        g.budget = None;
+        g
+    });
+    let stats = std::cell::Cell::new((0, 0, true));
     let content = grep.as_ref().map(|_| fsearch::content::Content::open_shared(dir.join("content")));
     let pool = rayon::ThreadPoolBuilder::new()
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-        })
+        .start_handler(|_| fsearch::os::set_qos(fsearch::os::Qos::Interactive))
         .build()
         .unwrap();
     let run = || -> Vec<String> {
@@ -181,6 +308,7 @@ fn bench(qs: &str) {
             let paths = pool.install(|| fsearch::content::scan_paths(&live, q.clone_for_scan()));
             fsearch::content::verify(g, &paths, q.limit)
         };
+        stats.set((r.candidates, r.read, r.complete));
         let first = |f: &fsearch::FileMatches| f.lines.first().map_or(String::new(), |(n, t)| format!("{n}: {}", t.trim()));
         r.files.iter().map(|f| format!("{}:{}", String::from_utf8_lossy(&f.path), first(f))).collect()
     };
@@ -189,32 +317,40 @@ fn bench(qs: &str) {
     let other = query::Query::parse("zzzzzz", &home).unwrap();
     let mut times = Vec::new();
     let mut out = Vec::new();
-    for _ in 0..20 {
+    let runs = std::env::var("FSEARCH_RUNS").ok().and_then(|r| r.parse().ok()).unwrap_or(20);
+    for _ in 0..runs {
         pool.install(|| query::Searcher { live: &live }.search(&other));
         let t = Instant::now();
         out = run();
         times.push(t.elapsed());
     }
-    for l in out.iter().take(10) {
+    let shown = if runs == 1 { out.len() } else { 10 };
+    for l in out.iter().take(shown) {
         println!("{l}");
     }
+    let (candidates, read, complete) = stats.get();
+    eprintln!("{} results; content: {candidates} candidates, {read} read, complete {complete}", out.len());
     let first = times[0];
     times.sort();
     eprintln!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0]);
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn install(login: bool) {
     // A plain reinstall keeps an existing login agent.
     let login = login || plist_path().exists();
@@ -267,10 +403,64 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
 }
 
+#[cfg(target_os = "macos")]
 fn uninstall() {
     launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     let _ = std::fs::remove_file(plist_path());
     println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+}
+
+#[cfg(windows)]
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(windows)]
+fn reg(args: &[&str]) -> bool {
+    let null = std::process::Stdio::null;
+    std::process::Command::new("reg").args(args).stdout(null()).stderr(null()).status().is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn install(login: bool) {
+    // A plain reinstall keeps an existing login entry.
+    let login = login || reg(&["query", RUN_KEY, "/v", "fsearch"]);
+    let profile = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default());
+    let bin = profile.join(r".local\bin\fsearch.exe");
+    // The next daemon must run the new binary.
+    server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    // A running exe can't be overwritten but can be renamed: move the old one
+    // aside (reinstalling from the installed copy), then put the new one in.
+    let tmp = bin.with_extension("new");
+    std::fs::copy(std::env::current_exe().unwrap(), &tmp).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    if bin.exists() {
+        std::fs::rename(&bin, bin.with_extension("old")).unwrap_or_else(|e| die(&format!("move old binary aside: {e}")));
+    }
+    std::fs::rename(&tmp, &bin).unwrap_or_else(|e| die(&format!("install: {e}")));
+    if !login {
+        println!("installed {}; the daemon starts on first use", bin.display());
+        return;
+    }
+    // A login entry can't carry environment variables: the daemon it starts
+    // reads the user's.
+    for k in ["FSEARCH_ROOTS", "FSEARCH_HOME"] {
+        if let Ok(v) = std::env::var(k) {
+            if !reg(&["add", r"HKCU\Environment", "/v", k, "/t", "REG_SZ", "/d", &v, "/f"]) {
+                die(&format!("could not save {k}"));
+            }
+            println!("saved {k}={v} as a user variable");
+        }
+    }
+    let cmd = format!("\"{}\" serve --log", bin.display());
+    if !reg(&["add", RUN_KEY, "/v", "fsearch", "/t", "REG_SZ", "/d", &cmd, "/f"]) {
+        die("could not add the login entry");
+    }
+    println!("installed {} (login entry {RUN_KEY}\\fsearch)", bin.display());
+}
+
+#[cfg(windows)]
+fn uninstall() {
+    reg(&["delete", RUN_KEY, "/v", "fsearch", "/f"]);
+    println!("removed the login entry; binary and index kept in {}", data_dir().display());
 }
 
 fn die(msg: &str) -> ! {

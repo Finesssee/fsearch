@@ -1,16 +1,27 @@
-//! The daemon: one `Engine`, answering JSON lines over a unix socket.
-//! `fsearch stdio` and the CLI are thin clients.
+//! The daemon: one `Engine`, answering JSON lines over a unix socket (a
+//! named pipe on Windows). `fsearch stdio` and the CLI are thin clients.
 
 use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, Found, GrepMode, Options, Query};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(windows)]
+use crate::pipe::{Listener as UnixListener, Pipe as UnixStream};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
+}
+
+/// One pipe per index folder, named by a hash of its path.
+#[cfg(windows)]
+pub fn socket_path(dir: &Path) -> PathBuf {
+    let h = dir.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    PathBuf::from(format!(r"\\.\pipe\fsearch-{h:016x}"))
 }
 
 pub fn serve(dir: PathBuf, home: String) {
@@ -25,6 +36,9 @@ pub fn serve(dir: PathBuf, home: String) {
     }
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
+    // A Windows lock also blocks reads, so the pid gets a file of its own.
+    #[cfg(windows)]
+    let _ = std::fs::write(dir.join("daemon.pid"), std::process::id().to_string());
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
         Err(e) => {
@@ -33,6 +47,7 @@ pub fn serve(dir: PathBuf, home: String) {
         }
     };
     let sock = socket_path(&dir);
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind socket");
     for conn in listener.incoming().flatten() {
@@ -41,6 +56,12 @@ pub fn serve(dir: PathBuf, home: String) {
     }
 }
 
+#[cfg(windows)]
+fn try_lock(f: &std::fs::File) -> bool {
+    f.try_lock().is_ok()
+}
+
+#[cfg(unix)]
 fn try_lock(f: &std::fs::File) -> bool {
     unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
@@ -57,9 +78,11 @@ pub fn stop(dir: &Path) -> Result<(), String> {
             return Ok(());
         }
         if killed.is_none() {
+            #[cfg(windows)]
+            let path = dir.join("daemon.pid");
             killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
             if let Some(pid) = killed {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
+                kill(pid);
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -70,13 +93,24 @@ pub fn stop(dir: &Path) -> Result<(), String> {
     })
 }
 
+#[cfg(unix)]
+fn kill(pid: i32) {
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+}
+
+#[cfg(windows)]
+fn kill(pid: i32) {
+    let null = std::process::Stdio::null;
+    let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).stdout(null()).stderr(null()).status();
+}
+
 /// How long the cores stay clocked up after an answer to a client that is
 /// still connected (typing): most gaps between keystrokes are shorter.
 const WARM: Duration = Duration::from_millis(250);
 
 fn handle(mut conn: UnixStream, engine: &Engine) {
     // Content searches run on this thread: keep them on performance cores.
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+    fsearch::os::set_qos(fsearch::os::Qos::Interactive);
     let Ok(r) = conn.try_clone() else { return };
     let mut out = Vec::new();
     for line in BufReader::new(r).lines() {
@@ -98,6 +132,12 @@ fn handle(mut conn: UnixStream, engine: &Engine) {
 /// The client is still connected with nothing more to ask yet: a session
 /// whose next request is a keystroke away. (One-shot clients like the CLI
 /// close their side as soon as the request is out.)
+#[cfg(windows)]
+fn waiting(_: &UnixStream) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn waiting(conn: &UnixStream) -> bool {
     let mut b = 0u8;
     let n = unsafe { libc::recv(std::os::fd::AsRawFd::as_raw_fd(conn), (&raw mut b).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
@@ -265,25 +305,110 @@ fn kind_name(k: u8) -> &'static str {
 /// Connect to the daemon, starting it if it isn't running.
 pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
     let sock = socket_path(dir);
-    if let Ok(s) = UnixStream::connect(&sock) {
+    if let Ok(s) = dial(&sock) {
         return Ok(s);
     }
+    spawn_daemon(dir)?;
+    for _ in 0..1500 {
+        std::thread::sleep(Duration::from_millis(2));
+        if let Ok(s) = dial(&sock) {
+            return Ok(s);
+        }
+    }
+    dial(&sock)
+}
+
+#[cfg(unix)]
+fn dial(sock: &Path) -> std::io::Result<UnixStream> {
+    UnixStream::connect(sock)
+}
+
+#[cfg(windows)]
+fn dial(sock: &Path) -> std::io::Result<UnixStream> {
+    crate::pipe::connect(sock)
+}
+
+#[cfg(unix)]
+fn spawn_daemon(dir: &Path) -> std::io::Result<()> {
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"))?;
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     // Own session: closing the terminal that started it doesn't kill it.
     unsafe {
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             libc::setsid();
             Ok(())
         });
     }
     cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
-    for _ in 0..1500 {
-        std::thread::sleep(Duration::from_millis(2));
-        if let Ok(s) = UnixStream::connect(&sock) {
-            return Ok(s);
-        }
+    Ok(())
+}
+
+/// Started with no handles inherited at all: `Command` passes every
+/// inheritable handle on, and a daemon holding a pipe of the shell that ran
+/// the client keeps `fsearch x | findstr y` waiting for EOF. The daemon
+/// opens its own log (`serve --log`).
+#[cfg(windows)]
+fn spawn_daemon(_dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[repr(C)]
+    struct StartupInfo {
+        cb: u32,
+        rest: [u8; 100],
     }
-    UnixStream::connect(&sock)
+    #[repr(C)]
+    struct ProcessInfo {
+        process: *mut std::ffi::c_void,
+        thread: *mut std::ffi::c_void,
+        pid: u32,
+        tid: u32,
+    }
+    unsafe extern "system" {
+        fn CreateProcessW(
+            app: *const u16,
+            cmd: *mut u16,
+            pa: *const std::ffi::c_void,
+            ta: *const std::ffi::c_void,
+            inherit: i32,
+            flags: u32,
+            env: *const std::ffi::c_void,
+            cwd: *const u16,
+            si: *const StartupInfo,
+            pi: *mut ProcessInfo,
+        ) -> i32;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+    }
+    let exe = std::env::current_exe()?;
+    let mut line: Vec<u16> = format!("\"{}\" serve --log", exe.display()).encode_utf16().chain([0]).collect();
+    let app: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let si = StartupInfo { cb: std::mem::size_of::<StartupInfo>() as u32, rest: [0; 100] };
+    let mut pi = ProcessInfo { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), pid: 0, tid: 0 };
+    // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: no console, and closing the
+    // terminal doesn't kill it.
+    let ok = unsafe { CreateProcessW(app.as_ptr(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0, 0x0800_0000 | 0x0000_0200, std::ptr::null(), std::ptr::null(), &si, &mut pi) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        CloseHandle(pi.thread);
+        CloseHandle(pi.process);
+    }
+    Ok(())
+}
+
+/// Point stdout and stderr at `daemon.log`, for a daemon started with no
+/// handles.
+#[cfg(windows)]
+pub fn log_to(dir: &Path) {
+    use std::os::windows::io::IntoRawHandle;
+    unsafe extern "system" {
+        fn SetStdHandle(n: u32, h: *mut std::ffi::c_void) -> i32;
+    }
+    std::fs::create_dir_all(dir).ok();
+    let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")) else { return };
+    let Ok(dup) = log.try_clone() else { return };
+    unsafe {
+        SetStdHandle(-11i32 as u32, log.into_raw_handle());
+        SetStdHandle(-12i32 as u32, dup.into_raw_handle());
+    }
 }
