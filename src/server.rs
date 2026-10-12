@@ -17,11 +17,13 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
-/// One pipe per index folder, named by a hash of its path.
+/// One pipe per user and index folder, named by the user's SID and a hash of
+/// the folder's path.
 #[cfg(windows)]
 pub fn socket_path(dir: &Path) -> PathBuf {
     let h = dir.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-    PathBuf::from(format!(r"\\.\pipe\fsearch-{h:016x}"))
+    let sid = crate::pipe::user_sid().unwrap_or_default();
+    PathBuf::from(format!(r"\\.\pipe\fsearch-{sid}-{h:016x}"))
 }
 
 pub fn serve(dir: PathBuf, home: String) {
