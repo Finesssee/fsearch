@@ -44,6 +44,7 @@ const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x8;
 const PIPE_UNLIMITED_INSTANCES: u32 = 255;
 const ERROR_PIPE_CONNECTED: i32 = 535;
 const ERROR_PIPE_BUSY: i32 = 231;
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
 pub struct Listener {
     name: Vec<u16>,
@@ -133,7 +134,10 @@ fn sid_string(sid: *mut c_void) -> std::io::Result<String> {
 /// busy. The pipe must be owned by this user: anyone can create a pipe under
 /// the expected name first, and queries must not go to them.
 pub fn connect(name: &Path) -> std::io::Result<Pipe> {
-    let open = || std::fs::OpenOptions::new().read(true).write(true).open(name);
+    use std::os::windows::fs::OpenOptionsExt;
+    // Identification only: the server learns who connected but can't act as
+    // them, which matters until the owner check below has run.
+    let open = || std::fs::OpenOptions::new().read(true).write(true).security_qos_flags(SECURITY_IDENTIFICATION).open(name);
     let mut r = open();
     for _ in 0..500 {
         match r {

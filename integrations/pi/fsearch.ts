@@ -11,6 +11,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createGrepTool, DEFAULT_MAX_BYTES, formatSize, truncateHead, truncateLine } from "@mariozechner/pi-coding-agent";
 import { execFileSync, spawn } from "child_process";
 import { existsSync, statSync } from "fs";
+import { homedir } from "os";
 import path from "path";
 
 const DEFAULT_LIMIT = 100;
@@ -28,6 +29,9 @@ function userEnv(name: string): string | undefined {
 
 const ROOTS = (userEnv("FSEARCH_ROOTS") ?? "").split(";").filter(Boolean).map((r) => r.toLowerCase());
 const HOME = userEnv("FSEARCH_HOME");
+// An absolute path: on Windows a bare name is looked up in the cwd first, so a
+// repo could ship its own fsearch.exe.
+const BIN = process.env.FSEARCH_BIN ?? path.join(homedir(), ".local", "bin", process.platform === "win32" ? "fsearch.exe" : "fsearch");
 const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 
 function inGitRepo(dir: string): boolean {
@@ -39,7 +43,7 @@ function inGitRepo(dir: string): boolean {
 
 /** The folder fsearch should search, or null if this search belongs to ripgrep. */
 function wideScope(dir: string): string | null {
-	if (!ROOTS.length || HOME === undefined) return null;
+	if (!ROOTS.length || HOME === undefined || !path.isAbsolute(BIN) || !existsSync(BIN)) return null;
 	try {
 		if (!statSync(dir).isDirectory()) return null;
 	} catch {
@@ -56,7 +60,7 @@ type Reply = { ok?: boolean; complete?: boolean; indexing?: number; files?: { pa
 function ask(req: object, signal?: AbortSignal): Promise<Reply> {
 	return new Promise((resolve, reject) => {
 		const env = { ...process.env, FSEARCH_ROOTS: ROOTS.join(";"), FSEARCH_HOME: HOME };
-		const child = spawn("fsearch", ["stdio"], { env, stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+		const child = spawn(BIN, ["stdio"], { env, stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
 		let out = "";
 		const onAbort = () => child.kill();
 		signal?.addEventListener("abort", onAbort, { once: true });
